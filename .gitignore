@@ -9,3 +9,6 @@ package-lock.json
 main.js
 data.json
 *.js.map
+
+# 设计文档
+FleurPilot-Fork-改造设计文档.md

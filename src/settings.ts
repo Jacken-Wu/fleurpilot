@@ -20,12 +20,32 @@ export const MODEL_PRESETS: ModelPreset[] = [
     { id: 'custom', name: '自定义', baseUrl: '', model: '' },
 ];
 
-export interface InlineEditModalSize {
-    width: number;
-    height: number;
-    top?: number;
-    left?: number;
-}
+/**
+ * 内联编辑专用的默认系统提示词。
+ * 与对话（chat）的系统提示词分开：内联编辑是"就地改写"任务，需要一套
+ * 面向成品输出、保真、Markdown 结构的严格纪律，不能与闲聊式对话共用。
+ */
+export const DEFAULT_INLINE_SYSTEM_PROMPT = `你是我的私人笔记写作助手，服务于一个以中文为主、可能夹杂英文术语的 Markdown 知识库，默认使用简体中文输出。
+
+全局纪律（优先级最高）：
+1. 输出即成品。只输出可以直接使用或直接替换原文的正文，绝不添加解释、前言、结语、客套话，不写"以下是……""改动如下：""希望对你有帮助"之类的内容，也不要用代码块或引号把整段结果包起来。
+2. 保真。不改变原意，不增删事实与关键信息，不臆造数据、引用、来源或结论；不确定的信息宁可不写。
+3. 输出 Markdown。默认按 Markdown 格式输出。
+   3.1 已有结构保持不变。若输入带有 Markdown 块级标记，保持每个块的类型与层级不变：标题仍是同级标题，列表仍是列表，段落仍是段落，引用仍是引用。不升级、不降级、不新增块级标记。
+   3.2 纯文本需推断结构。若输入不含任何 Markdown 块级标记、看起来是纯文本，则先判断它包含哪几个语义块，再把各块补全为规范 Markdown：
+       - 独立成行、简短、无句末标点、语义上像主题标签的行 → 标题（顶层默认用 ##，逐级用 ###、####）；
+       - 行首带数字序号或项目符号，或若干并列短句分行排列 → 有序列表或无序列列表；
+       - 连续的普通叙述 → 段落；
+       - 转述他人观点或标注来源的行 → 引用（>）；
+       - 多行多列、明显成表的数据 → 表格（仅在分隔清晰时）。
+       推断务必克制：只在信号明确时升级结构，模棱两可时一律保留为普通段落，绝不无中生有地制造标题、列表或表格。结构推断只添加块级标记，不改动文字本身，也不改变句子的语序与用词（这段不算违反第 2 条）。
+   3.3 单段落例外。若输入不含块级结构，且本身只是一个单独段落（单一语义块），输出一个普通段落即可，不添加任何块级标记（不加 #、>、-、*、数字序号、代码围栏），也不改写为标题、列表或引用；只保留该段落内原本已有的行内格式（加粗、斜体、行内代码、链接、公式等）。
+   3.4 判断顺序。先看输入是否含块级标记：含 → 按 3.1 保留；不含且含多个语义块 → 按 3.2 推断补全；不含且只有单一语义块 → 按 3.3 原样输出。判断依据是结构信号，不是文本长度。
+4. 保细节。人名、地名、专有名词、术语、缩写、数字、单位、公式、代码、文件名一律保持准确。
+5. 中文正文用中文标点；代码、命令、链接、英文术语按各自规范书写。不使用 emoji，除非原文已在用。
+6. 语气克制、准确、自然，优先清晰与信息密度，不堆砌辞藻。
+
+若具体任务指令与上述冲突，以具体任务指令为准。`;
 
 export interface FleurPilotSettings {
     provider: string;
@@ -35,7 +55,10 @@ export interface FleurPilotSettings {
     secretStorageMode: 'system' | 'vault';
     model: string;
     reasoningModel: string;
+    /** 对话（chat 侧边栏）的系统提示词 */
     systemPrompt: string;
+    /** 内联编辑专用的系统提示词（与 chat 分开） */
+    inlineSystemPrompt: string;
     temperature: number;
     maxTokens: number;
     enableContext: boolean;
@@ -47,12 +70,14 @@ export interface FleurPilotSettings {
     inlineExpandPrompt: string;
     inlineShortenPrompt: string;
     inlineContinuePrompt: string;
+    inlineExplainPrompt: string;
+    inlineElaboratePrompt: string;
+    inlineProofreadPrompt: string;
     enableInlineEdit: boolean;
     enableQuickCommands: boolean;
     enableChatHistory: boolean;
     chatHistoryFolder: string;
     language: Lang;
-    inlineEditModalSize?: InlineEditModalSize;
 }
 
 export const DEFAULT_SETTINGS: FleurPilotSettings = {
@@ -63,6 +88,7 @@ export const DEFAULT_SETTINGS: FleurPilotSettings = {
     model: 'deepseek-chat',
     reasoningModel: 'deepseek-reasoner',
     systemPrompt: '你是一位专业的写作伙伴，熟悉各类文本的梳理、润色与扩展。请基于用户提供的笔记内容，给出清晰、准确、可直接使用的回复，保持简洁、克制、实用。',
+    inlineSystemPrompt: DEFAULT_INLINE_SYSTEM_PROMPT,
     temperature: 0.7,
     maxTokens: 4096,
     enableContext: true,
@@ -72,6 +98,9 @@ export const DEFAULT_SETTINGS: FleurPilotSettings = {
     inlineExpandPrompt: '',
     inlineShortenPrompt: '',
     inlineContinuePrompt: '',
+    inlineExplainPrompt: '',
+    inlineElaboratePrompt: '',
+    inlineProofreadPrompt: '',
     enableInlineEdit: true,
     enableQuickCommands: true,
     enableChatHistory: false,
@@ -238,16 +267,6 @@ export class FleurPilotSettingTab extends PluginSettingTab {
                 },
             },
             {
-                name: $('settings.systemPrompt'),
-                desc: $('settings.systemPromptDesc'),
-                control: {
-                    type: 'textarea',
-                    key: 'systemPrompt',
-                    placeholder: $('settings.systemPromptPlaceholder'),
-                    rows: 3,
-                },
-            },
-            {
                 name: $('settings.temperature'),
                 desc: $('settings.temperatureDesc'),
                 control: {
@@ -286,44 +305,106 @@ export class FleurPilotSettingTab extends PluginSettingTab {
                 },
             },
             {
-                name: $('settings.inlinePolishPrompt'),
-                desc: $('settings.inlinePromptDesc'),
-                control: {
-                    type: 'textarea',
-                    key: 'inlinePolishPrompt',
-                    placeholder: $('settings.inlinePromptPlaceholder'),
-                    rows: 2,
-                },
+                type: 'group',
+                heading: $('settings.promptGroupSystem'),
+                items: [
+                    {
+                        name: $('settings.systemPrompt'),
+                        desc: $('settings.systemPromptDesc'),
+                        control: {
+                            type: 'textarea',
+                            key: 'systemPrompt',
+                            placeholder: $('settings.systemPromptPlaceholder'),
+                            rows: 3,
+                        },
+                    },
+                    {
+                        name: $('settings.inlineSystemPrompt'),
+                        desc: $('settings.inlineSystemPromptDesc'),
+                        control: {
+                            type: 'textarea',
+                            key: 'inlineSystemPrompt',
+                            placeholder: $('settings.inlineSystemPromptPlaceholder'),
+                            rows: 6,
+                        },
+                    },
+                ],
             },
             {
-                name: $('settings.inlineExpandPrompt'),
-                desc: $('settings.inlinePromptDesc'),
-                control: {
-                    type: 'textarea',
-                    key: 'inlineExpandPrompt',
-                    placeholder: $('settings.inlinePromptPlaceholder'),
-                    rows: 2,
-                },
-            },
-            {
-                name: $('settings.inlineShortenPrompt'),
-                desc: $('settings.inlinePromptDesc'),
-                control: {
-                    type: 'textarea',
-                    key: 'inlineShortenPrompt',
-                    placeholder: $('settings.inlinePromptPlaceholder'),
-                    rows: 2,
-                },
-            },
-            {
-                name: $('settings.inlineContinuePrompt'),
-                desc: $('settings.inlinePromptDesc'),
-                control: {
-                    type: 'textarea',
-                    key: 'inlineContinuePrompt',
-                    placeholder: $('settings.inlinePromptPlaceholder'),
-                    rows: 2,
-                },
+                type: 'group',
+                heading: $('settings.promptGroupAction'),
+                items: [
+                    {
+                        name: $('settings.inlinePolishPrompt'),
+                        desc: $('settings.inlinePromptDesc'),
+                        control: {
+                            type: 'textarea',
+                            key: 'inlinePolishPrompt',
+                            placeholder: $('settings.inlinePromptPlaceholder'),
+                            rows: 2,
+                        },
+                    },
+                    {
+                        name: $('settings.inlineExpandPrompt'),
+                        desc: $('settings.inlinePromptDesc'),
+                        control: {
+                            type: 'textarea',
+                            key: 'inlineExpandPrompt',
+                            placeholder: $('settings.inlinePromptPlaceholder'),
+                            rows: 2,
+                        },
+                    },
+                    {
+                        name: $('settings.inlineElaboratePrompt'),
+                        desc: $('settings.inlinePromptDesc'),
+                        control: {
+                            type: 'textarea',
+                            key: 'inlineElaboratePrompt',
+                            placeholder: $('settings.inlinePromptPlaceholder'),
+                            rows: 2,
+                        },
+                    },
+                    {
+                        name: $('settings.inlineShortenPrompt'),
+                        desc: $('settings.inlinePromptDesc'),
+                        control: {
+                            type: 'textarea',
+                            key: 'inlineShortenPrompt',
+                            placeholder: $('settings.inlinePromptPlaceholder'),
+                            rows: 2,
+                        },
+                    },
+                    {
+                        name: $('settings.inlineContinuePrompt'),
+                        desc: $('settings.inlinePromptDesc'),
+                        control: {
+                            type: 'textarea',
+                            key: 'inlineContinuePrompt',
+                            placeholder: $('settings.inlinePromptPlaceholder'),
+                            rows: 2,
+                        },
+                    },
+                    {
+                        name: $('settings.inlineExplainPrompt'),
+                        desc: $('settings.inlinePromptDesc'),
+                        control: {
+                            type: 'textarea',
+                            key: 'inlineExplainPrompt',
+                            placeholder: $('settings.inlinePromptPlaceholder'),
+                            rows: 2,
+                        },
+                    },
+                    {
+                        name: $('settings.inlineProofreadPrompt'),
+                        desc: $('settings.inlinePromptDesc'),
+                        control: {
+                            type: 'textarea',
+                            key: 'inlineProofreadPrompt',
+                            placeholder: $('settings.inlinePromptPlaceholder'),
+                            rows: 2,
+                        },
+                    },
+                ],
             },
             {
                 name: $('settings.enableInlineEdit'),

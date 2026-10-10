@@ -46,6 +46,8 @@ Compared to Copilot-style plugins, FleurPilot is designed around how Chinese use
 
 ### Installation
 
+> **FleurPilot is not published to the Obsidian community plugin marketplace.** Install it manually — download a release build or build from source, then copy the files into your vault.
+
 **Option A — Download the bundle (recommended):**
 
 1. Download `fleurpilot-1.0.2.zip` from [Releases](https://github.com/gibsonchan-5/fleurpilot/releases)
@@ -108,6 +110,8 @@ npm run build
 | 自定义 | 任意 OpenAI 兼容接口 |
 
 ### 安装
+
+> **本插件未上架 Obsidian 社区插件市场。** 请手动安装：下载发布包或从源码构建，再把文件复制进 vault。
 
 **方式 A — 一键打包下载（推荐）：**
 

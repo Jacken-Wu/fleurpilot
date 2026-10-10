@@ -2,7 +2,8 @@
 import { App, Plugin, Notice, Editor, Menu, Modal } from 'obsidian';
 import { FleurPilotSettings, DEFAULT_SETTINGS, FleurPilotSettingTab, applyProviderPreset, MODEL_PRESETS } from './settings';
 import { ChatView, VIEW_TYPE_CHAT } from './views/chat-view';
-import { InlineEditModal, InlineEditAction } from './modals/inline-edit';
+import { InlineEditView, VIEW_TYPE_INLINE } from './views/inline-view';
+import { InlineEditController, InlineEditAction } from './core/inline-edit-controller';
 import { WritingAssistantModal, WritingTask } from './modals/writing-assistant';
 import { t } from './i18n';
 import {
@@ -102,6 +103,9 @@ export default class FleurPilotPlugin extends Plugin {
     /** 本机 Obsidian 是否支持官方 SecretStorage（系统钥匙串）。 */
     secretStorageAvailable = false;
 
+    /** 内联改写任务控制器（侧边栏任务的生成与状态） */
+    inlineEdit!: InlineEditController;
+
     /** 当前实际生效的密钥后端（system=钥匙串，vault=data.json 明文）。 */
     get secretBackend(): SecretBackend {
         return resolveBackend(this.app, this.settings.secretStorageMode);
@@ -113,11 +117,16 @@ export default class FleurPilotPlugin extends Plugin {
     async onload() {
         await this.loadSettings();
 
+        // 内联改写控制器
+        this.inlineEdit = new InlineEditController(this.app, this);
+
         // 注册视图
         this.registerView(VIEW_TYPE_CHAT, (leaf) => new ChatView(leaf, this));
+        this.registerView(VIEW_TYPE_INLINE, (leaf) => new InlineEditView(leaf, this));
 
         // Ribbon
         this.addRibbonIcon('pen-tool', this.$('chat.title'), () => { void this.activateChatView(); });
+        this.addRibbonIcon('wand-2', this.$('inline.viewTitle'), () => { void this.activateInlineView(); });
 
         // 基础命令
         this.addCommand({
@@ -129,6 +138,11 @@ export default class FleurPilotPlugin extends Plugin {
             id: 'new-chat',
             name: this.$('command.newChat'),
             callback: () => { void this.activateChatView(true); },
+        });
+        this.addCommand({
+            id: 'open-inline-view',
+            name: this.$('command.openInlineView'),
+            callback: () => { void this.activateInlineView(); },
         });
 
         // 右键上下文菜单
@@ -179,6 +193,7 @@ export default class FleurPilotPlugin extends Plugin {
                         { id: 'polish', label: this.$('menu.polish') },
                         { id: 'simplify', label: this.$('menu.shorten') },
                         { id: 'expand', label: this.$('menu.expand') },
+                        { id: 'elaborate', label: this.$('menu.elaborate') },
                         { id: 'continue', label: this.$('menu.continue') },
                         { id: 'translate_zh', label: this.$('menu.translateCN') },
                         { id: 'translate_en', label: this.$('menu.translateEN') },
@@ -188,10 +203,7 @@ export default class FleurPilotPlugin extends Plugin {
                     for (const act of editActions) {
                         submenu.addItem((sub) => {
                             sub.setTitle(act.label).onClick(() => {
-                                new InlineEditModal(
-                                    this.app, this, selected, act.id, '',
-                                    (result) => this.applyEditResult(editor, act.id, result)
-                                ).open();
+                                void this.submitInlineEdit(editor, act.id);
                             });
                         });
                     }
@@ -203,10 +215,7 @@ export default class FleurPilotPlugin extends Plugin {
                         sub.setTitle(this.$('menu.custom')).onClick(() => {
                             new CustomInputModal(this.app, (instruction) => {
                                 if (!instruction) return;
-                                new InlineEditModal(
-                                    this.app, this, selected, 'custom', instruction,
-                                    (result) => editor.replaceSelection(result)
-                                ).open();
+                                void this.submitInlineEdit(editor, 'custom', instruction);
                             }).open();
                         });
                     });
@@ -218,6 +227,7 @@ export default class FleurPilotPlugin extends Plugin {
         this.registerInlineEditCommand('explain', this.$('command.explain'));
         this.registerInlineEditCommand('simplify', this.$('command.shorten'));
         this.registerInlineEditCommand('expand', this.$('command.expand'));
+        this.registerInlineEditCommand('elaborate', this.$('command.elaborate'));
         this.registerInlineEditCommand('continue', this.$('command.continue'));
         this.registerInlineEditCommand('polish', this.$('command.polish'));
         this.registerInlineEditCommand('translate_zh', this.$('command.translateCN'));
@@ -243,10 +253,7 @@ export default class FleurPilotPlugin extends Plugin {
                 }
                 new CustomInputModal(this.app, (instruction) => {
                     if (!instruction) return;
-                    new InlineEditModal(
-                        this.app, this, selectedText, 'custom', instruction,
-                        (result) => editor.replaceSelection(result)
-                    ).open();
+                    void this.submitInlineEdit(editor, 'custom', instruction);
                 }).open();
             },
         });
@@ -387,23 +394,42 @@ export default class FleurPilotPlugin extends Plugin {
     }
 
     /**
-     * 应用改写结果到编辑器。
-     * 续写（continue）保留原文、在选区末尾追加；其余动作用结果替换选中文本。
+     * 触发一次内联改写：抓快照 → 推入侧边栏任务队列。
+     * 不再打开模态窗，触发瞬间不抢焦点。
      */
-    private applyEditResult(editor: Editor, action: InlineEditAction, result: string) {
-        if (action === 'continue') {
-            // 只在选区末尾插入，原文保持不动
-            editor.replaceRange(result, editor.getCursor('to'));
-        } else {
-            editor.replaceSelection(result);
+    private async submitInlineEdit(editor: Editor, action: InlineEditAction, customInstruction = ''): Promise<void> {
+        const selected = editor.getSelection();
+        if (action !== 'continue' && !selected) {
+            new Notice(this.$('notice.selectText'));
+            return;
         }
+        // md 笔记走文件路径定位；白板等非 md 场景传 null，改用持有的编辑器引用
+        const active = this.app.workspace.getActiveFile();
+        const file = active && active.extension === 'md' ? active : null;
+        await this.activateInlineView(editor);
+        void this.inlineEdit.submit({
+            editor,
+            file,
+            displayName: active?.basename ?? '',
+            action,
+            customInstruction,
+            insertMode: action === 'continue' ? 'append' : 'replace',
+        });
     }
 
-    /** 获取光标前的文本，供无选区续写时作为上下文（最多约 3000 字符） */
-    private getPrecedingText(editor: Editor): string {
-        const cursor = editor.getCursor();
-        const from = { line: Math.max(0, cursor.line - 100), ch: 0 };
-        return editor.getRange(from, cursor).slice(-3000);
+    /** 打开（或聚焦）内联改写侧边栏；可选在之后把焦点还给编辑器 */
+    async activateInlineView(editor?: Editor): Promise<void> {
+        const { workspace } = this.app;
+        let leaf = workspace.getLeavesOfType(VIEW_TYPE_INLINE)[0];
+        if (!leaf) {
+            const rightLeaf = workspace.getRightLeaf(false);
+            if (rightLeaf) {
+                await rightLeaf.setViewState({ type: VIEW_TYPE_INLINE, active: true });
+                leaf = rightLeaf;
+            }
+        }
+        if (leaf) void workspace.revealLeaf(leaf);
+        if (editor) window.setTimeout(() => editor.focus(), 0);
     }
 
     private registerInlineEditCommand(action: InlineEditAction, name: string) {
@@ -411,17 +437,7 @@ export default class FleurPilotPlugin extends Plugin {
             id: `inline-edit-${action}`,
             name,
             editorCallback: (editor: Editor) => {
-                // 续写允许无选区：取光标前的内容作为上下文，直接在光标处接着写
-                const selectedText = editor.getSelection()
-                    || (action === 'continue' ? this.getPrecedingText(editor) : '');
-                if (!selectedText) {
-                    new Notice(this.$('notice.selectText'));
-                    return;
-                }
-                new InlineEditModal(
-                    this.app, this, selectedText, action, '',
-                    (result) => this.applyEditResult(editor, action, result)
-                ).open();
+                void this.submitInlineEdit(editor, action);
             },
         });
     }
